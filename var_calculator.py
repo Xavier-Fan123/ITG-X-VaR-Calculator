@@ -178,6 +178,11 @@ class DataIngestion:
         """
         Extract metadata for all available assets.
 
+        新逻辑（方案2）：
+        - 不再假设每个 ProductID 都有 Settlement 和 Spot
+        - 根据实际数据判断：期货ID (如 "SG180 Apr26") 只有 Settlement
+        - 现货ID (如 "SG180") 只有 Spot
+
         Returns:
             List of AssetMetadata objects for each product/price-type combination.
         """
@@ -196,25 +201,38 @@ class DataIngestion:
         metadata_list = []
 
         for _, row in products.iterrows():
-            # Create Settlement asset
-            metadata_list.append(AssetMetadata(
-                asset_id=f"{row['ProductID']}_Settlement",
-                product_id=row["ProductID"],
-                product_name=row["ProductName"],
-                price_type="Settlement",
-                unit=row["Unit"],
-                currency=row["Currency"]
-            ))
+            product_id = row['ProductID']
 
-            # Create Spot asset
-            metadata_list.append(AssetMetadata(
-                asset_id=f"{row['ProductID']}_Spot",
-                product_id=row["ProductID"],
-                product_name=row["ProductName"],
-                price_type="Spot",
-                unit=row["Unit"],
-                currency=row["Currency"]
-            ))
+            # 获取该 ProductID 的所有数据
+            product_data = df[df["ProductID"] == product_id]
+
+            # 检查是否有有效的 Settlement 数据（非全 NaN）
+            has_settlement = product_data["Settlement"].notna().any()
+
+            # 检查是否有有效的 Spot 数据（非全 NaN）
+            has_spot = product_data["Spot"].notna().any()
+
+            if has_settlement:
+                # Create Settlement asset
+                metadata_list.append(AssetMetadata(
+                    asset_id=f"{product_id}_Settlement",
+                    product_id=product_id,
+                    product_name=row["ProductName"],
+                    price_type="Settlement",
+                    unit=row["Unit"],
+                    currency=row["Currency"]
+                ))
+
+            if has_spot:
+                # Create Spot asset
+                metadata_list.append(AssetMetadata(
+                    asset_id=f"{product_id}_Spot",
+                    product_id=product_id,
+                    product_name=row["ProductName"],
+                    price_type="Spot",
+                    unit=row["Unit"],
+                    currency=row["Currency"]
+                ))
 
         # Sort by product ID for consistent ordering
         metadata_list.sort(key=lambda x: (x.product_id, x.price_type))
@@ -225,6 +243,11 @@ class DataIngestion:
     def get_price_matrix(self, lookback_days: int = 250) -> pd.DataFrame:
         """
         Generate a wide-format price matrix with forward-filled missing values.
+
+        新逻辑（方案2）：
+        - 期货ID (如 "SG180 Apr26") 只有 Settlement 列
+        - 现货ID (如 "SG180") 只有 Spot 列
+        - 删除全是 NaN 的列
 
         Args:
             lookback_days: Number of most recent trading days to include.
@@ -266,10 +289,13 @@ class DataIngestion:
         # 1. Replace 0 values with NaN (0 is likely missing data, not actual zero price)
         price_matrix = price_matrix.replace(0, np.nan)
 
-        # 2. Forward fill (ffill) to handle non-trading days
+        # 2. 删除全是 NaN 的列（新数据结构下，期货ID没有Spot，现货ID没有Settlement）
+        price_matrix = price_matrix.dropna(axis=1, how='all')
+
+        # 3. Forward fill (ffill) to handle non-trading days
         price_matrix = price_matrix.ffill()
 
-        # 3. Backward fill for any remaining NaN at the start
+        # 4. Backward fill for any remaining NaN at the start
         price_matrix = price_matrix.bfill()
 
         # Sort columns for consistent ordering
@@ -290,6 +316,9 @@ class DataIngestion:
 
         This prevents artificial zero returns from destroying correlations
         between related assets (e.g., Settlement vs Spot for same product).
+
+        新逻辑（方案2）：
+        - 删除全是 NaN 的列（期货ID没有Spot，现货ID没有Settlement）
 
         Args:
             lookback_days: Number of trading days for the return calculation window.
@@ -322,6 +351,9 @@ class DataIngestion:
 
         # Replace 0 with NaN (0 means missing data, not actual zero price)
         price_matrix_raw = price_matrix_raw.replace(0, np.nan)
+
+        # 删除全是 NaN 的列（新数据结构下，期货ID没有Spot，现货ID没有Settlement）
+        price_matrix_raw = price_matrix_raw.dropna(axis=1, how='all')
 
         # Sort columns for consistent ordering
         price_matrix_raw = price_matrix_raw.reindex(sorted(price_matrix_raw.columns), axis=1)
