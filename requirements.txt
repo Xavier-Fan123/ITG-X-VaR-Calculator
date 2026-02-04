@@ -4,3 +4,4 @@ openpyxl>=3.1.0
 streamlit>=1.28.0
 scipy>=1.11.0
 yfinance>=0.2.30
+matplotlib>=3.7.0
