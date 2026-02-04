@@ -495,8 +495,8 @@ class RiskEngine:
         cov_matrix = self.calculate_ewma_covariance()
 
         # Portfolio variance: V^T · Σ · V
-        positions = np.array(positions).reshape(-1, 1)
-        portfolio_variance = float(positions.T @ cov_matrix @ positions)
+        positions = np.array(positions).flatten()  # Ensure 1D array
+        portfolio_variance = positions @ cov_matrix @ positions  # Result is scalar
 
         # Portfolio standard deviation
         portfolio_std = np.sqrt(portfolio_variance)
@@ -744,19 +744,37 @@ def main():
     # Load Data
     # =========================================================================
 
-    # Determine file path
-    if uploaded_file is not None:
-        # Save uploaded file temporarily
-        import tempfile
-        import os
+    # Determine file path - with session state caching
+    import tempfile
+    import os
 
-        suffix = os.path.splitext(uploaded_file.name)[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded_file.getvalue())
-            file_path = tmp.name
+    if uploaded_file is not None:
+        # Cache uploaded file in session state to persist across interactions
+        file_bytes = uploaded_file.getvalue()
+        file_name = uploaded_file.name
+
+        # Check if this is a new file or same as cached
+        if ("uploaded_file_bytes" not in st.session_state or
+            st.session_state.uploaded_file_bytes != file_bytes):
+            st.session_state.uploaded_file_bytes = file_bytes
+            st.session_state.uploaded_file_name = file_name
+
+            # Save to temp file
+            suffix = os.path.splitext(file_name)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                st.session_state.uploaded_file_path = tmp.name
+
+        file_path = st.session_state.uploaded_file_path
+        st.sidebar.success(f"✅ 已加载: {st.session_state.uploaded_file_name}")
+
+    elif "uploaded_file_path" in st.session_state:
+        # Use previously uploaded file from session state
+        file_path = st.session_state.uploaded_file_path
+        st.sidebar.success(f"✅ 已加载: {st.session_state.uploaded_file_name}")
+
     else:
         # Use default file
-        import os
         file_path = os.path.join(os.path.dirname(__file__), "group VaR model.XLSX")
 
     # Initialize data ingestion
