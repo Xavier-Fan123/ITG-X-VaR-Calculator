@@ -674,9 +674,10 @@ def main():
         layout="wide"
     )
 
-    # Custom CSS for better styling
+    # Custom CSS for better styling (支持深色/浅色模式)
     st.markdown("""
     <style>
+    /* 浅色模式 */
     .main-header {
         font-size: 2.5rem;
         font-weight: 700;
@@ -693,6 +694,43 @@ def main():
         padding: 1rem;
         border-radius: 0.5rem;
         border: 1px solid #E2E8F0;
+    }
+
+    /* 深色模式适配 */
+    @media (prefers-color-scheme: dark) {
+        .main-header {
+            color: #93C5FD !important;  /* 浅蓝色 */
+        }
+        .sub-header {
+            color: #9CA3AF !important;  /* 浅灰色 */
+        }
+        .stMetric {
+            background-color: #1F2937 !important;
+            border: 1px solid #374151 !important;
+        }
+    }
+
+    /* Streamlit 深色主题适配 (data-theme 属性) */
+    [data-theme="dark"] .main-header,
+    [data-testid="stAppViewContainer"][data-theme="dark"] .main-header {
+        color: #93C5FD !important;
+    }
+    [data-theme="dark"] .sub-header,
+    [data-testid="stAppViewContainer"][data-theme="dark"] .sub-header {
+        color: #9CA3AF !important;
+    }
+    [data-theme="dark"] .stMetric,
+    [data-testid="stAppViewContainer"][data-theme="dark"] .stMetric {
+        background-color: #1F2937 !important;
+        border: 1px solid #374151 !important;
+    }
+
+    /* 基于 Streamlit 的 CSS 变量 (最可靠的方法) */
+    :root {
+        --header-color-light: #1E3A5F;
+        --header-color-dark: #93C5FD;
+        --subheader-color-light: #6B7280;
+        --subheader-color-dark: #9CA3AF;
     }
     </style>
     """, unsafe_allow_html=True)
