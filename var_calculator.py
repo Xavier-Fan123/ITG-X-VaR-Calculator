@@ -696,10 +696,6 @@ def format_currency(value: float, currency: str = "CNY") -> str:
 # Exposure Table Parsing
 # =============================================================================
 
-# Valid product codes for exposure table
-VALID_EXPOSURE_PRODUCTS = {"SG180", "SG380", "MF 0.5", "GO 10ppm", "Brt Fut"}
-VALID_EXPOSURE_UNITS = {"MT", "BBL", "BBLS"}
-
 # Column header mapping (Chinese -> internal)
 EXPOSURE_HEADER_MAP = {
     "品种": "ProductCode",
@@ -710,14 +706,45 @@ EXPOSURE_HEADER_MAP = {
 }
 
 
-def parse_exposure_table(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
+def _extract_base_products(asset_columns: List[str]) -> set:
+    """
+    Extract base product codes from asset column names.
+
+    Handles both formats:
+    - "CUFI_Settlement" -> "CUFI"
+    - "SG380 Apr26_Spot" -> "SG380"
+    - "Brt Fut Jun26_Settlement" -> "Brt Fut"
+    - "GO 10ppm Apr26_Spot" -> "GO 10ppm"
+    """
+    import re
+    month_pattern = re.compile(
+        r"\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\d{2}$"
+    )
+    products = set()
+    for col in asset_columns:
+        # Remove suffix (_Settlement or _Spot)
+        base = col.rsplit("_", 1)[0]
+        # Also add the full base (with month) for exact matching
+        products.add(base)
+        # Strip trailing contract month (e.g., "Brt Fut Jun26" -> "Brt Fut")
+        product_name = month_pattern.sub("", base).strip()
+        products.add(product_name)
+    return products
+
+
+def parse_exposure_table(
+    uploaded_file,
+    valid_products: Optional[set] = None,
+) -> Tuple[pd.DataFrame, List[str]]:
     """
     Parse an exposure table Excel file (敞口表).
 
     Expected columns: 品种 | 合约月份 | 现货持仓 | 期货持仓 | 单位
 
     Args:
-        uploaded_file: Streamlit UploadedFile object.
+        uploaded_file: Streamlit UploadedFile object or file-like.
+        valid_products: Optional set of valid product codes from loaded price data.
+                        If None, all products are accepted (validation deferred to mapping).
 
     Returns:
         Tuple of (parsed DataFrame, list of warning messages).
@@ -748,11 +775,10 @@ def parse_exposure_table(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
         if not product or product in ("nan", "None", ""):
             continue
 
-        # Validate product
-        if product not in VALID_EXPOSURE_PRODUCTS:
+        # Validate product against loaded data (if provided)
+        if valid_products is not None and product not in valid_products:
             warnings_list.append(
-                f"第{row_num}行: 未知品种 '{product}'，"
-                f"有效品种: {', '.join(sorted(VALID_EXPOSURE_PRODUCTS))}。已跳过。"
+                f"第{row_num}行: 品种 '{product}' 在当前价格数据中不存在，已跳过。"
             )
             continue
 
@@ -780,15 +806,12 @@ def parse_exposure_table(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
             )
             continue
 
-        # Parse and validate unit
-        unit = str(row.get("Unit", "MT")).strip().upper()
+        # Parse unit (accept any unit — different datasets use different units)
+        unit = str(row.get("Unit", "")).strip().upper()
         if unit in ("NAN", "NONE", ""):
-            unit = "MT"
+            unit = "-"
         elif unit == "BBLS":
             unit = "BBL"
-        elif unit not in VALID_EXPOSURE_UNITS:
-            warnings_list.append(f"第{row_num}行: 无效单位 '{unit}'，使用默认 'MT'。")
-            unit = "MT"
 
         # Warn if futures position has no contract month
         if futures != 0 and contract_month is None:
@@ -1406,23 +1429,30 @@ def main():
             "上传包含现货/期货持仓的Excel敞口表，系统将自动解析并计算 **VaR + CVaR**。"
         )
 
+        # Show available products from loaded data
+        available_products_set = _extract_base_products(list(returns.columns))
+        # Filter to base product codes only (not "SG380 Apr26", just "SG380")
+        base_products = sorted({
+            col.rsplit("_", 1)[0].split(" ")[0]
+            for col in returns.columns
+        })
+
         # Format info
         with st.expander("📋 敞口表格式说明", expanded=False):
-            st.markdown("""
+            st.markdown(f"""
             **Excel列名（中文表头）：**
 
             | 品种 | 合约月份 | 现货持仓 | 期货持仓 | 单位 |
             |------|----------|----------|----------|------|
-            | SG180 | | 5000 | | MT |
-            | SG380 | Apr26 | 3000 | -2000 | MT |
-            | GO 10ppm | | 2000 | -1000 | MT |
-            | Brt Fut | Jun26 | | 5000 | BBL |
+            | {base_products[0] if base_products else 'XXX'} | | 5000 | | - |
+            | {base_products[1] if len(base_products) > 1 else 'YYY'} | Apr26 | 3000 | -2000 | - |
 
             **规则：**
-            - **品种**: SG180, SG380, MF 0.5, GO 10ppm, Brt Fut
+            - **品种**: 必须在已加载的价格数据中存在。当前可用品种 ({len(base_products)}个):
+              `{', '.join(base_products[:15])}{'...' if len(base_products) > 15 else ''}`
             - **合约月份**: 期货持仓时填写（如 Apr26, May26），现货可留空
             - **正数 = 多头，负数 = 空头**，空白 = 0
-            - **单位**: MT (公吨) 或 BBL (桶)
+            - **单位**: 自由填写（如 MT, BBL, TON, KG 等），留空则显示 "-"
             - 每行至少一个持仓列非零
             """)
 
@@ -1443,7 +1473,11 @@ def main():
 
                 # Parse the exposure table
                 try:
-                    exposure_df, parse_warnings = parse_exposure_table(exposure_file)
+                    # Extract valid product codes dynamically from loaded price data
+                    available_products = _extract_base_products(list(returns.columns))
+                    exposure_df, parse_warnings = parse_exposure_table(
+                        exposure_file, valid_products=available_products
+                    )
                 except ValueError as e:
                     st.error(f"❌ 解析错误: {str(e)}")
                     exposure_df = None
