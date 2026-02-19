@@ -543,6 +543,39 @@ class RiskEngine:
 
         return var_1day
 
+    def calculate_portfolio_cvar(
+        self,
+        positions: np.ndarray,
+        confidence: float = 0.95
+    ) -> float:
+        """
+        Calculate portfolio CVaR (Conditional VaR / Expected Shortfall).
+
+        Uses parametric method: CVaR = σ_p × φ(z_α) / (1 - α)
+        where φ is the standard normal PDF and z_α is the quantile.
+
+        Args:
+            positions: Position vector (signed notional amounts).
+            confidence: Confidence level (0.95 or 0.99).
+
+        Returns:
+            CVaR value in the same currency as positions.
+        """
+        cov_matrix = self.calculate_ewma_covariance()
+
+        positions = np.array(positions).flatten()
+        portfolio_variance = positions @ cov_matrix @ positions
+        portfolio_std = np.sqrt(portfolio_variance)
+
+        z_score = self.Z_SCORES.get(confidence)
+        if z_score is None:
+            z_score = norm.ppf(confidence)
+
+        # CVaR = σ × φ(z_α) / (1 - α)
+        cvar_1day = portfolio_std * norm.pdf(z_score) / (1 - confidence)
+
+        return cvar_1day
+
     def get_var_results(
         self,
         positions: np.ndarray
@@ -579,6 +612,38 @@ class RiskEngine:
         }
 
         return results
+
+    def get_var_cvar_results(
+        self,
+        positions: np.ndarray
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Calculate comprehensive VaR and CVaR results.
+
+        Returns:
+            Dictionary with VaR and CVaR values for 1-Day and 10-Day horizons.
+        """
+        var_1d_95 = self.calculate_portfolio_var(positions, 0.95)
+        var_1d_99 = self.calculate_portfolio_var(positions, 0.99)
+        cvar_1d_95 = self.calculate_portfolio_cvar(positions, 0.95)
+        cvar_1d_99 = self.calculate_portfolio_cvar(positions, 0.99)
+
+        sqrt_10 = np.sqrt(10)
+
+        return {
+            "1-Day": {
+                "VaR_95%": var_1d_95,
+                "VaR_99%": var_1d_99,
+                "CVaR_95%": cvar_1d_95,
+                "CVaR_99%": cvar_1d_99,
+            },
+            "10-Day": {
+                "VaR_95%": var_1d_95 * sqrt_10,
+                "VaR_99%": var_1d_99 * sqrt_10,
+                "CVaR_95%": cvar_1d_95 * sqrt_10,
+                "CVaR_99%": cvar_1d_99 * sqrt_10,
+            },
+        }
 
     def get_correlation_matrix(self) -> pd.DataFrame:
         """
@@ -625,6 +690,284 @@ def format_currency(value: float, currency: str = "CNY") -> str:
         return f"{value:,.2f} {currency}"
     else:
         return f"{value:.4f} {currency}"
+
+
+# =============================================================================
+# Exposure Table Parsing
+# =============================================================================
+
+# Valid product codes for exposure table
+VALID_EXPOSURE_PRODUCTS = {"SG180", "SG380", "MF 0.5", "GO 10ppm", "Brt Fut"}
+VALID_EXPOSURE_UNITS = {"MT", "BBL", "BBLS"}
+
+# Column header mapping (Chinese -> internal)
+EXPOSURE_HEADER_MAP = {
+    "品种": "ProductCode",
+    "合约月份": "ContractMonth",
+    "现货持仓": "SpotPosition",
+    "期货持仓": "FuturesPosition",
+    "单位": "Unit",
+}
+
+
+def parse_exposure_table(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Parse an exposure table Excel file (敞口表).
+
+    Expected columns: 品种 | 合约月份 | 现货持仓 | 期货持仓 | 单位
+
+    Args:
+        uploaded_file: Streamlit UploadedFile object.
+
+    Returns:
+        Tuple of (parsed DataFrame, list of warning messages).
+    """
+    try:
+        df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        raise ValueError(f"无法读取Excel文件: {str(e)}")
+
+    # Rename columns using header map
+    df.columns = [EXPOSURE_HEADER_MAP.get(col.strip(), col.strip()) for col in df.columns]
+
+    # Validate required column exists
+    if "ProductCode" not in df.columns:
+        raise ValueError(
+            "未找到必需的列 '品种'。\n"
+            "期望的列名: 品种, 合约月份, 现货持仓, 期货持仓, 单位"
+        )
+
+    warnings_list: List[str] = []
+    rows: List[Dict] = []
+
+    for idx, row in df.iterrows():
+        row_num = idx + 2  # Excel row number (1-indexed header + data)
+
+        # Get product code
+        product = str(row.get("ProductCode", "")).strip()
+        if not product or product in ("nan", "None", ""):
+            continue
+
+        # Validate product
+        if product not in VALID_EXPOSURE_PRODUCTS:
+            warnings_list.append(
+                f"第{row_num}行: 未知品种 '{product}'，"
+                f"有效品种: {', '.join(sorted(VALID_EXPOSURE_PRODUCTS))}。已跳过。"
+            )
+            continue
+
+        # Parse contract month
+        contract_month = str(row.get("ContractMonth", "")).strip()
+        if contract_month in ("", "nan", "None", "NaT"):
+            contract_month = None
+
+        # Parse positions (handle NaN, empty, string values)
+        def safe_float(val) -> float:
+            if pd.isna(val):
+                return 0.0
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return 0.0
+
+        spot = safe_float(row.get("SpotPosition", 0))
+        futures = safe_float(row.get("FuturesPosition", 0))
+
+        # Skip rows with both positions zero
+        if spot == 0 and futures == 0:
+            warnings_list.append(
+                f"第{row_num}行: '{product}' 现货和期货持仓均为零，已跳过。"
+            )
+            continue
+
+        # Parse and validate unit
+        unit = str(row.get("Unit", "MT")).strip().upper()
+        if unit in ("NAN", "NONE", ""):
+            unit = "MT"
+        elif unit == "BBLS":
+            unit = "BBL"
+        elif unit not in VALID_EXPOSURE_UNITS:
+            warnings_list.append(f"第{row_num}行: 无效单位 '{unit}'，使用默认 'MT'。")
+            unit = "MT"
+
+        # Warn if futures position has no contract month
+        if futures != 0 and contract_month is None:
+            warnings_list.append(
+                f"第{row_num}行: '{product}' 期货持仓无合约月份，将使用通用期货价格。"
+            )
+
+        rows.append({
+            "ProductCode": product,
+            "ContractMonth": contract_month,
+            "SpotPosition": spot,
+            "FuturesPosition": futures,
+            "Unit": unit,
+        })
+
+    if not rows:
+        raise ValueError("未找到有效的敞口数据。请检查文件格式和品种名称。")
+
+    return pd.DataFrame(rows), warnings_list
+
+
+def _find_asset_id(
+    product: str,
+    contract_month: Optional[str],
+    price_type: str,
+    asset_columns: List[str],
+) -> Optional[str]:
+    """
+    Find the matching asset_id in the price matrix columns.
+
+    Data has product IDs like "SG380 Apr26" with both Settlement and Spot.
+    Mapping rules:
+    - With contract month: "{product} {month}_{price_type}"
+    - Without contract month (spot): find the front month for that product
+    """
+    if contract_month:
+        # Direct match with contract month
+        asset_id = f"{product} {contract_month}_{price_type}"
+        if asset_id in asset_columns:
+            return asset_id
+
+    # Also try without contract month (in case data has bare product IDs)
+    bare_id = f"{product}_{price_type}"
+    if bare_id in asset_columns:
+        return bare_id
+
+    # If no contract month, find the front (first available) month for this product
+    if not contract_month:
+        candidates = [
+            col for col in asset_columns
+            if col.startswith(f"{product} ") and col.endswith(f"_{price_type}")
+        ]
+        if candidates:
+            # Sort to get the front month (alphabetical gives chronological for MonYY format)
+            candidates.sort()
+            return candidates[0]
+
+    return None
+
+
+def build_exposure_position_vector(
+    exposure_df: pd.DataFrame,
+    returns: pd.DataFrame,
+    latest_prices: pd.Series,
+    asset_metadata: List[AssetMetadata],
+    fx_rate: float,
+) -> Tuple[np.ndarray, List[Dict], List[str]]:
+    """
+    Build the position vector from parsed exposure data.
+
+    Data structure: ProductIDs are like "SG380 Apr26" with both Settlement and Spot.
+    Mapping:
+    - Spot position for "SG380" (no month) -> find front month's Spot price
+    - Spot position for "SG380" month "Apr26" -> "SG380 Apr26_Spot"
+    - Futures position for "SG380" month "Apr26" -> "SG380 Apr26_Settlement"
+
+    Args:
+        exposure_df: Parsed exposure DataFrame.
+        returns: Returns DataFrame (columns = asset IDs).
+        latest_prices: Latest prices Series.
+        asset_metadata: List of AssetMetadata objects.
+        fx_rate: USD/CNY exchange rate.
+
+    Returns:
+        Tuple of (position_vector, active_positions_list, warnings).
+    """
+    asset_columns = list(returns.columns)
+    position_vector = np.zeros(len(asset_columns))
+    active_positions = []
+    warnings_list: List[str] = []
+
+    asset_index_map = {col: i for i, col in enumerate(asset_columns)}
+    asset_meta_map = {a.asset_id: a for a in asset_metadata}
+
+    for _, row in exposure_df.iterrows():
+        product = row["ProductCode"]
+        contract_month = row["ContractMonth"]
+        spot_qty = row["SpotPosition"]
+        futures_qty = row["FuturesPosition"]
+        unit = row["Unit"]
+
+        # --- Handle Spot Position ---
+        if spot_qty != 0:
+            spot_asset_id = _find_asset_id(product, contract_month, "Spot", asset_columns)
+
+            if spot_asset_id and spot_asset_id in asset_index_map:
+                idx = asset_index_map[spot_asset_id]
+                price = latest_prices.get(spot_asset_id, 0)
+
+                if price > 0:
+                    notional = spot_qty * price
+
+                    asset_meta = asset_meta_map.get(spot_asset_id)
+                    currency = asset_meta.currency if asset_meta else "USD"
+                    if currency == "USD":
+                        notional *= fx_rate
+
+                    position_vector[idx] += notional
+
+                    active_positions.append({
+                        "ProductCode": product,
+                        "PositionType": "现货",
+                        "ContractMonth": contract_month or "(前月)",
+                        "Quantity": spot_qty,
+                        "Unit": unit,
+                        "Price": price,
+                        "Currency": currency,
+                        "Notional_CNY": abs(notional),
+                        "Direction": "多头" if spot_qty > 0 else "空头",
+                        "AssetID": spot_asset_id,
+                    })
+                else:
+                    warnings_list.append(f"'{product}' 现货价格为零或不可用，已跳过现货持仓。")
+            else:
+                warnings_list.append(
+                    f"'{product}' 无现货价格数据，已跳过现货持仓。"
+                    f"（可用资产: 需要 '{product} <月份>_Spot'）"
+                )
+
+        # --- Handle Futures Position ---
+        if futures_qty != 0:
+            futures_asset_id = _find_asset_id(product, contract_month, "Settlement", asset_columns)
+
+            if futures_asset_id and futures_asset_id in asset_index_map:
+                idx = asset_index_map[futures_asset_id]
+                price = latest_prices.get(futures_asset_id, 0)
+
+                if price > 0:
+                    notional = futures_qty * price
+
+                    asset_meta = asset_meta_map.get(futures_asset_id)
+                    currency = asset_meta.currency if asset_meta else "USD"
+                    if currency == "USD":
+                        notional *= fx_rate
+
+                    position_vector[idx] += notional
+
+                    active_positions.append({
+                        "ProductCode": product,
+                        "PositionType": "期货",
+                        "ContractMonth": contract_month or "(前月)",
+                        "Quantity": futures_qty,
+                        "Unit": unit,
+                        "Price": price,
+                        "Currency": currency,
+                        "Notional_CNY": abs(notional),
+                        "Direction": "多头" if futures_qty > 0 else "空头",
+                        "AssetID": futures_asset_id,
+                    })
+                else:
+                    warnings_list.append(
+                        f"'{product}' 期货 ({contract_month or '通用'}) 价格为零或不可用，已跳过。"
+                    )
+            else:
+                warnings_list.append(
+                    f"'{product}' 无期货价格数据 (合约月份: {contract_month or '未指定'})，已跳过期货持仓。"
+                )
+
+    return position_vector, active_positions, warnings_list
 
 
 def create_position_input(
@@ -873,260 +1216,460 @@ def main():
         products[asset.product_id]["assets"].append(asset)
 
     # =========================================================================
-    # Position Input Form
+    # Main Mode Selection: Manual Input vs Exposure Upload
     # =========================================================================
 
-    st.header("📝 输入头寸")
-
-    # Create tabs for CNY and USD products
-    cny_products = {k: v for k, v in products.items() if v["currency"] == "CNY"}
-    usd_products = {k: v for k, v in products.items() if v["currency"] == "USD"}
-
-    tab_cny, tab_usd = st.tabs([
-        f"🇨🇳 人民币产品 ({len(cny_products)})",
-        f"🇺🇸 美元产品 ({len(usd_products)})"
+    main_tab_manual, main_tab_exposure = st.tabs([
+        "📝 手动输入头寸",
+        "📤 上传敞口表 (Exposure VaR)",
     ])
 
-    positions_input = {}
+    # =========================================================================
+    # TAB 1: Manual Position Input (original functionality)
+    # =========================================================================
+    with main_tab_manual:
 
-    with tab_cny:
-        st.info("💡 请输入头寸数量，单位如括号所示。多头(Long) = 做多敞口，空头(Short) = 做空敞口")
+        st.header("📝 输入头寸")
 
-        # Create columns for better layout
-        col1, col2 = st.columns(2)
+        # Create tabs for CNY and USD products
+        cny_products = {k: v for k, v in products.items() if v["currency"] == "CNY"}
+        usd_products = {k: v for k, v in products.items() if v["currency"] == "USD"}
 
-        product_list = list(cny_products.items())
-        mid = len(product_list) // 2
+        tab_cny, tab_usd = st.tabs([
+            f"🇨🇳 人民币产品 ({len(cny_products)})",
+            f"🇺🇸 美元产品 ({len(usd_products)})"
+        ])
 
-        for idx, (product_id, product_info) in enumerate(product_list):
-            target_col = col1 if idx < mid else col2
+        positions_input = {}
 
-            with target_col:
+        with tab_cny:
+            st.info("💡 请输入头寸数量，单位如括号所示。多头(Long) = 做多敞口，空头(Short) = 做空敞口")
+
+            col1, col2 = st.columns(2)
+            product_list = list(cny_products.items())
+            mid = len(product_list) // 2
+
+            for idx, (product_id, product_info) in enumerate(product_list):
+                target_col = col1 if idx < mid else col2
+                with target_col:
+                    with st.expander(f"**{product_id}** - {product_info['name']} [{product_info['unit']}]"):
+                        for asset in product_info["assets"]:
+                            pos, direction = create_position_input(asset, "cny")
+                            positions_input[asset.asset_id] = {
+                                "position": pos,
+                                "direction": direction,
+                                "asset": asset
+                            }
+
+        with tab_usd:
+            st.warning(f"⚠️ 美元头寸将按汇率 **{fx_rate:.4f}** 转换为人民币")
+            for product_id, product_info in usd_products.items():
                 with st.expander(f"**{product_id}** - {product_info['name']} [{product_info['unit']}]"):
                     for asset in product_info["assets"]:
-                        pos, direction = create_position_input(asset, "cny")
+                        pos, direction = create_position_input(asset, "usd")
                         positions_input[asset.asset_id] = {
                             "position": pos,
                             "direction": direction,
                             "asset": asset
                         }
 
-    with tab_usd:
-        st.warning(f"⚠️ 美元头寸将按汇率 **{fx_rate:.4f}** 转换为人民币")
+        st.divider()
 
-        for product_id, product_info in usd_products.items():
-            with st.expander(f"**{product_id}** - {product_info['name']} [{product_info['unit']}]"):
-                for asset in product_info["assets"]:
-                    pos, direction = create_position_input(asset, "usd")
-                    positions_input[asset.asset_id] = {
-                        "position": pos,
-                        "direction": direction,
-                        "asset": asset
-                    }
+        # Calculate VaR
+        col_calc, col_clear = st.columns([1, 5])
+        with col_calc:
+            calculate_button = st.button("🧮 计算VaR", type="primary", width="stretch")
+        with col_clear:
+            if st.button("🗑️ 清空"):
+                st.rerun()
 
-    st.divider()
+        if calculate_button:
+            position_vector = []
+            active_positions = []
 
-    # =========================================================================
-    # Calculate VaR
-    # =========================================================================
+            for asset_id in returns.columns:
+                if asset_id in positions_input:
+                    info = positions_input[asset_id]
+                    quantity = info["position"]
+                    direction = info["direction"]
+                    asset = info["asset"]
 
-    col_calc, col_clear = st.columns([1, 5])
+                    current_price = latest_prices.get(asset_id, 0)
+                    notional = quantity * current_price
+                    signed_notional = notional if direction == "Long" else -notional
 
-    with col_calc:
-        calculate_button = st.button("🧮 计算VaR", type="primary", width="stretch")
+                    if asset.currency == "USD":
+                        signed_notional *= fx_rate
 
-    with col_clear:
-        if st.button("🗑️ 清空"):
-            st.rerun()
+                    position_vector.append(signed_notional)
 
-    if calculate_button:
-        # Build position vector
-        position_vector = []
-        active_positions = []
-
-        # Get the asset order from returns columns
-        for asset_id in returns.columns:
-            if asset_id in positions_input:
-                info = positions_input[asset_id]
-                quantity = info["position"]  # User input is QUANTITY (e.g., tons)
-                direction = info["direction"]
-                asset = info["asset"]
-
-                # Get current price for this asset
-                current_price = latest_prices.get(asset_id, 0)
-
-                # Calculate NOTIONAL VALUE = Quantity × Price
-                notional = quantity * current_price
-
-                # Apply direction (Long = positive, Short = negative)
-                signed_notional = notional if direction == "Long" else -notional
-
-                # Convert USD to CNY for USD-denominated assets
-                if asset.currency == "USD":
-                    signed_notional *= fx_rate
-
-                position_vector.append(signed_notional)
-
-                if quantity != 0:
-                    active_positions.append({
-                        "Asset": asset.display_name,
-                        "ID": asset.asset_id,
-                        "Quantity": quantity,
-                        "Unit": asset.unit,
-                        "Price": current_price,
-                        "Direction": direction,
-                        "Currency": asset.currency,
-                        "Notional (CNY)": abs(signed_notional)
-                    })
-            else:
-                position_vector.append(0.0)
-
-        position_vector = np.array(position_vector)
-
-        # Check if any positions were entered
-        if np.allclose(position_vector, 0):
-            st.warning("⚠️ 请至少输入一个非零头寸")
-        else:
-            # Initialize Risk Engine
-            try:
-                engine = RiskEngine(returns, decay_factor=decay_factor)
-                results = engine.get_var_results(position_vector)
-            except Exception as e:
-                st.error(f"❌ VaR计算错误: {str(e)}")
-                st.stop()
-
-            # =========================================================================
-            # Display Results
-            # =========================================================================
-
-            st.header("📊 VaR计算结果")
-
-            # Results table
-            results_df = pd.DataFrame({
-                "置信水平": ["95%", "99%"],
-                "1日VaR (CNY)": [
-                    format_currency(results["1-Day"]["95%"]),
-                    format_currency(results["1-Day"]["99%"])
-                ],
-                "10日VaR (CNY)": [
-                    format_currency(results["10-Day"]["95%"]),
-                    format_currency(results["10-Day"]["99%"])
-                ]
-            })
-
-            # Display as metrics
-            col1, col2, col3, col4 = st.columns(4)
-
-            with col1:
-                st.metric(
-                    "1日VaR (95%)",
-                    format_currency(results["1-Day"]["95%"]),
-                    help="95%置信度下1日最大预期损失"
-                )
-
-            with col2:
-                st.metric(
-                    "1日VaR (99%)",
-                    format_currency(results["1-Day"]["99%"]),
-                    help="99%置信度下1日最大预期损失"
-                )
-
-            with col3:
-                st.metric(
-                    "10日VaR (95%)",
-                    format_currency(results["10-Day"]["95%"]),
-                    help="95%置信度下10日最大预期损失 (√10缩放)"
-                )
-
-            with col4:
-                st.metric(
-                    "10日VaR (99%)",
-                    format_currency(results["10-Day"]["99%"]),
-                    help="99%置信度下10日最大预期损失 (√10缩放)"
-                )
-
-            st.divider()
-
-            # Active Positions Summary
-            st.subheader("📋 持仓汇总")
-
-            if active_positions:
-                positions_df = pd.DataFrame(active_positions)
-
-                # Rename columns to Chinese
-                column_rename = {
-                    "Asset": "资产",
-                    "ID": "代码",
-                    "Quantity": "数量",
-                    "Unit": "单位",
-                    "Price": "价格",
-                    "Direction": "方向",
-                    "Currency": "货币",
-                    "Notional (CNY)": "名义金额(CNY)"
-                }
-
-                # Format the dataframe for display
-                display_df = positions_df.copy()
-                display_df["Price"] = display_df["Price"].apply(lambda x: f"{x:,.2f}")
-                display_df["Notional (CNY)"] = display_df["Notional (CNY)"].apply(lambda x: f"{x:,.0f}")
-                display_df["Direction"] = display_df["Direction"].apply(lambda x: "多头" if x == "Long" else "空头")
-                display_df = display_df.rename(columns=column_rename)
-
-                st.dataframe(
-                    display_df,
-                    width="stretch",
-                    hide_index=True
-                )
-
-                # Summary stats
-                total_long = sum(p["Notional (CNY)"] for p in active_positions if p["Direction"] == "Long")
-                total_short = sum(p["Notional (CNY)"] for p in active_positions if p["Direction"] == "Short")
-
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("多头敞口", format_currency(total_long))
-                with col2:
-                    st.metric("空头敞口", format_currency(total_short))
-                with col3:
-                    st.metric("净敞口", format_currency(total_long - total_short))
-
-            st.divider()
-
-            # Volatility Analysis (Expandable)
-            with st.expander("📈 波动率与相关性分析"):
-                st.subheader("年化波动率 (活跃资产)")
-
-                vol_series = engine.get_individual_volatilities()
-
-                # Filter to show only active assets
-                active_asset_ids = [p["ID"] for p in active_positions]
-                active_vols = vol_series[vol_series.index.isin(active_asset_ids)]
-
-                if not active_vols.empty:
-                    vol_df = pd.DataFrame({
-                        "资产": active_vols.index,
-                        "年化波动率": [f"{v*100:.2f}%" for v in active_vols.values]
-                    })
-                    st.dataframe(vol_df, width="stretch", hide_index=True)
-
-                st.subheader("相关系数矩阵 (活跃资产)")
-
-                corr_matrix = engine.get_correlation_matrix()
-
-                if len(active_asset_ids) > 1:
-                    # Filter correlation matrix to active assets
-                    active_corr = corr_matrix.loc[
-                        corr_matrix.index.isin(active_asset_ids),
-                        corr_matrix.columns.isin(active_asset_ids)
-                    ]
-
-                    # Format as percentage
-                    st.dataframe(
-                        active_corr.style.format("{:.2%}").background_gradient(cmap="RdYlGn", vmin=-1, vmax=1),
-                        width="stretch"
-                    )
+                    if quantity != 0:
+                        active_positions.append({
+                            "Asset": asset.display_name,
+                            "ID": asset.asset_id,
+                            "Quantity": quantity,
+                            "Unit": asset.unit,
+                            "Price": current_price,
+                            "Direction": direction,
+                            "Currency": asset.currency,
+                            "Notional (CNY)": abs(signed_notional)
+                        })
                 else:
-                    st.info("输入2个以上资产头寸可查看相关系数矩阵")
+                    position_vector.append(0.0)
+
+            position_vector = np.array(position_vector)
+
+            if np.allclose(position_vector, 0):
+                st.warning("⚠️ 请至少输入一个非零头寸")
+            else:
+                try:
+                    engine = RiskEngine(returns, decay_factor=decay_factor)
+                    results = engine.get_var_results(position_vector)
+                except Exception as e:
+                    st.error(f"❌ VaR计算错误: {str(e)}")
+                    st.stop()
+
+                st.header("📊 VaR计算结果")
+
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("1日VaR (95%)", format_currency(results["1-Day"]["95%"]))
+                with col2:
+                    st.metric("1日VaR (99%)", format_currency(results["1-Day"]["99%"]))
+                with col3:
+                    st.metric("10日VaR (95%)", format_currency(results["10-Day"]["95%"]))
+                with col4:
+                    st.metric("10日VaR (99%)", format_currency(results["10-Day"]["99%"]))
+
+                st.divider()
+
+                st.subheader("📋 持仓汇总")
+                if active_positions:
+                    positions_df = pd.DataFrame(active_positions)
+                    display_df = positions_df.copy()
+                    display_df["Price"] = display_df["Price"].apply(lambda x: f"{x:,.2f}")
+                    display_df["Notional (CNY)"] = display_df["Notional (CNY)"].apply(lambda x: f"{x:,.0f}")
+                    display_df["Direction"] = display_df["Direction"].apply(lambda x: "多头" if x == "Long" else "空头")
+                    display_df = display_df.rename(columns={
+                        "Asset": "资产", "ID": "代码", "Quantity": "数量",
+                        "Unit": "单位", "Price": "价格", "Direction": "方向",
+                        "Currency": "货币", "Notional (CNY)": "名义金额(CNY)"
+                    })
+                    st.dataframe(display_df, width="stretch", hide_index=True)
+
+                    total_long = sum(p["Notional (CNY)"] for p in active_positions if p["Direction"] == "Long")
+                    total_short = sum(p["Notional (CNY)"] for p in active_positions if p["Direction"] == "Short")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("多头敞口", format_currency(total_long))
+                    with col2:
+                        st.metric("空头敞口", format_currency(total_short))
+                    with col3:
+                        st.metric("净敞口", format_currency(total_long - total_short))
+
+                st.divider()
+
+                with st.expander("📈 波动率与相关性分析"):
+                    st.subheader("年化波动率 (活跃资产)")
+                    vol_series = engine.get_individual_volatilities()
+                    active_asset_ids = [p["ID"] for p in active_positions]
+                    active_vols = vol_series[vol_series.index.isin(active_asset_ids)]
+
+                    if not active_vols.empty:
+                        vol_df = pd.DataFrame({
+                            "资产": active_vols.index,
+                            "年化波动率": [f"{v*100:.2f}%" for v in active_vols.values]
+                        })
+                        st.dataframe(vol_df, width="stretch", hide_index=True)
+
+                    st.subheader("相关系数矩阵 (活跃资产)")
+                    corr_matrix = engine.get_correlation_matrix()
+                    if len(active_asset_ids) > 1:
+                        active_corr = corr_matrix.loc[
+                            corr_matrix.index.isin(active_asset_ids),
+                            corr_matrix.columns.isin(active_asset_ids)
+                        ]
+                        st.dataframe(
+                            active_corr.style.format("{:.2%}").background_gradient(cmap="RdYlGn", vmin=-1, vmax=1),
+                            width="stretch"
+                        )
+                    else:
+                        st.info("输入2个以上资产头寸可查看相关系数矩阵")
+
+    # =========================================================================
+    # TAB 2: Exposure Table Upload (敞口表上传)
+    # =========================================================================
+    with main_tab_exposure:
+
+        st.header("📤 敞口表上传 (Exposure VaR)")
+        st.markdown(
+            "上传包含现货/期货持仓的Excel敞口表，系统将自动解析并计算 **VaR + CVaR**。"
+        )
+
+        # Format info
+        with st.expander("📋 敞口表格式说明", expanded=False):
+            st.markdown("""
+            **Excel列名（中文表头）：**
+
+            | 品种 | 合约月份 | 现货持仓 | 期货持仓 | 单位 |
+            |------|----------|----------|----------|------|
+            | SG180 | | 5000 | | MT |
+            | SG380 | Apr26 | 3000 | -2000 | MT |
+            | GO 10ppm | | 2000 | -1000 | MT |
+            | Brt Fut | Jun26 | | 5000 | BBL |
+
+            **规则：**
+            - **品种**: SG180, SG380, MF 0.5, GO 10ppm, Brt Fut
+            - **合约月份**: 期货持仓时填写（如 Apr26, May26），现货可留空
+            - **正数 = 多头，负数 = 空头**，空白 = 0
+            - **单位**: MT (公吨) 或 BBL (桶)
+            - 每行至少一个持仓列非零
+            """)
+
+        # File uploader
+        exposure_file = st.file_uploader(
+            "上传敞口表 (Excel)",
+            type=["xlsx", "xls"],
+            key="exposure_uploader",
+            help="拖拽或点击上传 .xlsx / .xls 文件，最大 10MB",
+        )
+
+        if exposure_file is not None:
+            # Validate file size
+            if exposure_file.size > 10 * 1024 * 1024:
+                st.error("❌ 文件大小超过10MB限制")
+            else:
+                st.info(f"📄 已选择: **{exposure_file.name}** ({exposure_file.size / 1024:.1f} KB)")
+
+                # Parse the exposure table
+                try:
+                    exposure_df, parse_warnings = parse_exposure_table(exposure_file)
+                except ValueError as e:
+                    st.error(f"❌ 解析错误: {str(e)}")
+                    exposure_df = None
+                    parse_warnings = []
+
+                if exposure_df is not None and len(exposure_df) > 0:
+                    # Show parsed data
+                    st.subheader("📄 解析结果 (敞口明细)")
+
+                    display_exposure = exposure_df.copy()
+                    display_exposure = display_exposure.rename(columns={
+                        "ProductCode": "品种",
+                        "ContractMonth": "合约月份",
+                        "SpotPosition": "现货持仓",
+                        "FuturesPosition": "期货持仓",
+                        "Unit": "单位",
+                    })
+                    # Replace None with "-"
+                    display_exposure["合约月份"] = display_exposure["合约月份"].fillna("-")
+
+                    st.dataframe(display_exposure, width="stretch", hide_index=True)
+
+                    # Show parse warnings
+                    if parse_warnings:
+                        with st.expander(f"⚠️ 解析警告 ({len(parse_warnings)})", expanded=True):
+                            for w in parse_warnings:
+                                st.warning(w)
+
+                    st.divider()
+
+                    # Build position vector and calculate VaR/CVaR
+                    position_vector, active_positions, build_warnings = build_exposure_position_vector(
+                        exposure_df, returns, latest_prices, asset_metadata, fx_rate
+                    )
+
+                    # Show build warnings
+                    all_warnings = parse_warnings + build_warnings
+                    if build_warnings:
+                        with st.expander(f"⚠️ 持仓映射警告 ({len(build_warnings)})", expanded=True):
+                            for w in build_warnings:
+                                st.warning(w)
+
+                    if np.allclose(position_vector, 0):
+                        st.error("❌ 所有敞口均无法匹配到价格数据，无法计算VaR。请检查品种名称和合约月份。")
+                    else:
+                        # Calculate VaR + CVaR
+                        try:
+                            engine = RiskEngine(returns, decay_factor=decay_factor)
+                            var_cvar_results = engine.get_var_cvar_results(position_vector)
+                        except Exception as e:
+                            st.error(f"❌ VaR/CVaR计算错误: {str(e)}")
+                            st.stop()
+
+                        # =============================================
+                        # Display VaR/CVaR Results
+                        # =============================================
+
+                        st.header("📊 组合风险汇总 (Portfolio Risk Summary)")
+
+                        # Summary chips
+                        col_s1, col_s2, col_s3 = st.columns(3)
+                        with col_s1:
+                            st.metric("解析行数", f"{len(exposure_df)} 行")
+                        with col_s2:
+                            st.metric("有效持仓", f"{len(active_positions)} 个")
+                        with col_s3:
+                            total_value = sum(p["Notional_CNY"] for p in active_positions)
+                            st.metric("总持仓价值", format_currency(total_value))
+
+                        st.divider()
+
+                        # VaR / CVaR metrics
+                        st.subheader("VaR & CVaR")
+
+                        res_1d = var_cvar_results["1-Day"]
+                        res_10d = var_cvar_results["10-Day"]
+
+                        # Row 1: 1-Day metrics
+                        st.markdown("**1日 (1-Day)**")
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1:
+                            st.metric("VaR 95%", format_currency(res_1d["VaR_95%"]),
+                                      help="95%置信度下1日最大预期损失")
+                        with c2:
+                            st.metric("VaR 99%", format_currency(res_1d["VaR_99%"]),
+                                      help="99%置信度下1日最大预期损失")
+                        with c3:
+                            st.metric("CVaR 95%", format_currency(res_1d["CVaR_95%"]),
+                                      help="95%置信度下1日条件期望损失")
+                        with c4:
+                            st.metric("CVaR 99%", format_currency(res_1d["CVaR_99%"]),
+                                      help="99%置信度下1日条件期望损失")
+
+                        # Row 2: 10-Day metrics
+                        st.markdown("**10日 (10-Day, √10缩放)**")
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1:
+                            st.metric("VaR 95%", format_currency(res_10d["VaR_95%"]))
+                        with c2:
+                            st.metric("VaR 99%", format_currency(res_10d["VaR_99%"]))
+                        with c3:
+                            st.metric("CVaR 95%", format_currency(res_10d["CVaR_95%"]))
+                        with c4:
+                            st.metric("CVaR 99%", format_currency(res_10d["CVaR_99%"]))
+
+                        # Summary table
+                        st.divider()
+                        st.subheader("📋 VaR/CVaR 汇总表")
+                        summary_table = pd.DataFrame({
+                            "指标": ["VaR (1日)", "CVaR (1日)", "VaR (10日)", "CVaR (10日)"],
+                            "95% 置信度": [
+                                format_currency(res_1d["VaR_95%"]),
+                                format_currency(res_1d["CVaR_95%"]),
+                                format_currency(res_10d["VaR_95%"]),
+                                format_currency(res_10d["CVaR_95%"]),
+                            ],
+                            "99% 置信度": [
+                                format_currency(res_1d["VaR_99%"]),
+                                format_currency(res_1d["CVaR_99%"]),
+                                format_currency(res_10d["VaR_99%"]),
+                                format_currency(res_10d["CVaR_99%"]),
+                            ],
+                        })
+                        st.dataframe(summary_table, width="stretch", hide_index=True)
+
+                        # =============================================
+                        # Position Detail Table
+                        # =============================================
+                        st.divider()
+                        st.subheader("📋 持仓明细 (Position Breakdown)")
+
+                        if active_positions:
+                            pos_df = pd.DataFrame(active_positions)
+
+                            # Per-position VaR (individual, undiversified)
+                            asset_col_map = {col: i for i, col in enumerate(returns.columns)}
+                            individual_vars = []
+                            for p in active_positions:
+                                asset_id = p["AssetID"]
+                                if asset_id in asset_col_map:
+                                    asset_idx = asset_col_map[asset_id]
+                                    # Single-asset position vector
+                                    single_pos = np.zeros(len(returns.columns))
+                                    single_pos[asset_idx] = position_vector[asset_idx]
+
+                                    cov_matrix = engine.calculate_ewma_covariance()
+                                    single_var = np.sqrt(single_pos @ cov_matrix @ single_pos)
+                                    daily_vol = np.sqrt(cov_matrix[asset_idx, asset_idx])
+
+                                    individual_vars.append({
+                                        "DailyVol": f"{daily_vol * 100:.2f}%",
+                                        "VaR_95": format_currency(single_var * 1.6449),
+                                        "CVaR_95": format_currency(single_var * norm.pdf(1.6449) / 0.05),
+                                        "VaR_99": format_currency(single_var * 2.3263),
+                                        "CVaR_99": format_currency(single_var * norm.pdf(2.3263) / 0.01),
+                                    })
+                                else:
+                                    individual_vars.append({
+                                        "DailyVol": "-",
+                                        "VaR_95": "-", "CVaR_95": "-",
+                                        "VaR_99": "-", "CVaR_99": "-",
+                                    })
+
+                            # Build display table
+                            detail_data = []
+                            for p, v in zip(active_positions, individual_vars):
+                                detail_data.append({
+                                    "品种": p["ProductCode"],
+                                    "类型": p["PositionType"],
+                                    "合约月份": p["ContractMonth"],
+                                    "数量": f"{p['Quantity']:,.0f} {p['Unit']}",
+                                    "价格": f"{p['Price']:,.2f}",
+                                    "名义金额(CNY)": f"{p['Notional_CNY']:,.0f}",
+                                    "方向": p["Direction"],
+                                    "日波动率": v["DailyVol"],
+                                    "VaR 95%": v["VaR_95"],
+                                    "CVaR 95%": v["CVaR_95"],
+                                    "VaR 99%": v["VaR_99"],
+                                    "CVaR 99%": v["CVaR_99"],
+                                })
+
+                            st.dataframe(
+                                pd.DataFrame(detail_data),
+                                width="stretch",
+                                hide_index=True,
+                            )
+
+                            # Long/Short summary
+                            total_long = sum(p["Notional_CNY"] for p in active_positions if p["Direction"] == "多头")
+                            total_short = sum(p["Notional_CNY"] for p in active_positions if p["Direction"] == "空头")
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("多头敞口", format_currency(total_long))
+                            with col2:
+                                st.metric("空头敞口", format_currency(total_short))
+                            with col3:
+                                st.metric("净敞口", format_currency(total_long - total_short))
+
+                        # Volatility & Correlation
+                        st.divider()
+                        with st.expander("📈 波动率与相关性分析"):
+                            vol_series = engine.get_individual_volatilities()
+                            active_asset_ids = [p["AssetID"] for p in active_positions]
+                            active_vols = vol_series[vol_series.index.isin(active_asset_ids)]
+
+                            if not active_vols.empty:
+                                st.subheader("年化波动率")
+                                vol_df = pd.DataFrame({
+                                    "资产": active_vols.index,
+                                    "年化波动率": [f"{v*100:.2f}%" for v in active_vols.values]
+                                })
+                                st.dataframe(vol_df, width="stretch", hide_index=True)
+
+                            corr_matrix = engine.get_correlation_matrix()
+                            if len(active_asset_ids) > 1:
+                                st.subheader("相关系数矩阵")
+                                active_corr = corr_matrix.loc[
+                                    corr_matrix.index.isin(active_asset_ids),
+                                    corr_matrix.columns.isin(active_asset_ids)
+                                ]
+                                st.dataframe(
+                                    active_corr.style.format("{:.2%}").background_gradient(
+                                        cmap="RdYlGn", vmin=-1, vmax=1
+                                    ),
+                                    width="stretch"
+                                )
 
     # =========================================================================
     # Footer
